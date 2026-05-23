@@ -1,0 +1,38 @@
+{
+  "name": "toklock",
+  "version": "1.0.0",
+  "description": "Token-aware rate-limit queue proxy for the Anthropic Claude API. Agents never see a 429.",
+  "type": "module",
+  "main": "src/proxy.mjs",
+  "bin": {
+    "toklock": "./bin/toklock.mjs"
+  },
+  "scripts": {
+    "start": "node bin/toklock.mjs",
+    "test": "node --test src/proxy.test.mjs"
+  },
+  "keywords": [
+    "anthropic",
+    "claude",
+    "rate-limit",
+    "proxy",
+    "queue",
+    "llm",
+    "ai-agent",
+    "token-bucket",
+    "claude-code"
+  ],
+  "author": "Tamilselvan Chandran <spreethy26@gmail.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tamilselvan89/toklock.git"
+  },
+  "homepage": "https://github.com/tamilselvan89/toklock#readme",
+  "bugs": {
+    "url": "https://github.com/tamilselvan89/toklock/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
