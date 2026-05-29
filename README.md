@@ -1,7 +1,7 @@
 # toklock
 
 **Token-aware rate-limit queue proxy for the Anthropic Claude API.**  
-Your AI agents never see a 429. They just wait.
+Your AI agents never see a 429. They just wait — and every agent gets a fair share.
 
 [![npm version](https://img.shields.io/npm/v/toklock)](https://www.npmjs.com/package/toklock)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
@@ -13,35 +13,37 @@ Your AI agents never see a 429. They just wait.
 Every existing LLM proxy handles rate limits by **returning a 429 to the caller**.  
 Your agent crashes. You add retry logic. The retry collides with other agents. You crash again.
 
+Worse — when you run multiple agents against a shared token budget, one greedy agent
+can exhaust the quota and starve every other agent waiting in the same queue.
+
 ```
-Agent A ──→ Anthropic API  ✓ (30k tokens used)
-Agent B ──→ Anthropic API  ✗ 429 Too Many Requests  ← agent crashes
-Agent C ──→ Anthropic API  ✗ 429 Too Many Requests  ← agent crashes
+Agent A ──→ Anthropic API  ✓ (consumes entire budget)
+Agent B ──→ Anthropic API  ✗ 429  ← crashes
+Agent C ──→ Anthropic API  ✗ 429  ← crashes
 ```
 
 ## The Solution
 
 toklock sits between your agents and `api.anthropic.com`.  
-It **queues requests** and releases them the moment Anthropic's response headers say capacity is available.  
-Callers never see a 429. They just wait transparently.
+It gives **each agent its own queue** and serves them in round-robin order,
+so no single agent can starve others. Budget decisions use real Anthropic
+response headers — no guessing, no estimation.
 
 ```
 Agent A ──→ toklock ──→ Anthropic API  ✓
-Agent B ──→ toklock     [queued 47s]   ✓  ← released when budget refills
-Agent C ──→ toklock     [queued 47s]   ✓  ← released when budget refills
+Agent B ──→ toklock     [fair share]   ✓  ← round-robin scheduled
+Agent C ──→ toklock     [fair share]   ✓  ← round-robin scheduled
 ```
 
 ### What makes toklock different
 
-| Tool | Approach | Caller sees 429? |
-|------|----------|-----------------|
-| Anthropic SDK | Retry 2x with backoff | Yes (after retries) |
-| Helicone | Bounded retry | Yes (after N retries) |
-| LiteLLM OSS | Returns 429 immediately | Yes |
-| LiteLLM Enterprise | Queue (paid) | No |
-| **toklock** | **Infinite transparent queue** | **Never** |
-
-toklock uses **real Anthropic response headers** (`anthropic-ratelimit-tokens-remaining`, `anthropic-ratelimit-tokens-reset`) as ground truth — not estimates, not timers. The queue releases at exactly the right moment.
+| Tool | Approach | Caller sees 429? | Fair across agents? |
+|------|----------|-----------------|---------------------|
+| Anthropic SDK | Retry 2x with backoff | Yes (after retries) | No |
+| Helicone | Bounded retry | Yes (after N retries) | No |
+| LiteLLM OSS | Returns 429 immediately | Yes | No |
+| LiteLLM Enterprise | Queue (paid) | No | No |
+| **toklock** | **Per-agent queue, round-robin** | **Never** | **Yes** |
 
 ---
 
@@ -86,7 +88,7 @@ TOKLOCK_PORT=4000 toklock    # via env var
 
 ---
 
-## Use with Claude Code agents (Paperclip, custom frameworks)
+## Use with Claude Code agents
 
 Set `ANTHROPIC_BASE_URL` before launching your agents:
 
@@ -95,7 +97,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
 ./run-agent.sh ceo
 ./run-agent.sh backend-engineer
 ./run-agent.sh qa-engineer
-# All three share the same token budget. None will crash.
+# All three share the same token budget fairly. None will crash.
+# Each agent gets equal scheduling priority via round-robin.
 ```
 
 ## Use with Docker Compose
@@ -117,15 +120,50 @@ services:
 
 ## How it works
 
-1. **Queue** — all requests enter a serial queue
-2. **Estimate** — token cost is estimated from request body before sending
-3. **Check** — if remaining budget < estimated cost, the queue pauses
-4. **Wait** — pause until `anthropic-ratelimit-tokens-reset` (exact reset time from headers)
-5. **Release** — request is forwarded to `api.anthropic.com`
-6. **Correct** — real token counts from response headers update the budget
-7. **Repeat** — next queued request is evaluated
+### Per-connection fair queuing
 
-On 429: request is re-queued, proxy waits for `Retry-After`, then retries.
+Each TCP connection to toklock gets its own FIFO queue. Since each agent process
+opens its own connection, this maps naturally to one queue per agent — no
+configuration needed.
+
+When the token budget is scarce, toklock round-robins across all connection queues.
+An agent that sends 100 requests gets the same scheduling share as an agent that
+sends 1.
+
+### Reactive budget control
+
+toklock never estimates token costs. All throttling decisions are made from
+Anthropic's real response headers:
+
+| Header | Used for |
+|--------|----------|
+| `anthropic-ratelimit-tokens-remaining` | Current budget after each response |
+| `anthropic-ratelimit-tokens-reset` | When the window resets |
+| `retry-after` | How long to pause on a 429 |
+
+### Three budget states
+
+```
+remaining > 10,000   →  full concurrency (3 parallel requests)
+remaining < 10,000   →  slow lane (1 at a time)
+remaining < 3,000    →  full pause until reset window
+429 received         →  pause for Retry-After, re-queue to front
+```
+
+### 429 handling
+
+On a 429, the request is placed back at the **front of its own connection queue**
+and all new dispatches pause for the full `Retry-After` duration. When the pause
+clears, that request is next — nothing jumps ahead of it during the wait.
+
+### Request flow
+
+1. **Queue** — request enters its connection's FIFO queue
+2. **Schedule** — round-robin picks the next request across all connections
+3. **Check** — budget state determines concurrency level
+4. **Dispatch** — request is forwarded to `api.anthropic.com`
+5. **Correct** — real token counts from response headers update the budget
+6. **Repeat** — next queued request is evaluated
 
 ---
 
