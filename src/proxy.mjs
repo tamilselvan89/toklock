@@ -20,28 +20,13 @@
 
 import http from 'http';
 
-const UPSTREAM           = 'https://api.anthropic.com';
+const DEFAULT_UPSTREAM   = 'https://api.anthropic.com';
 const DEFAULT_PORT       = 4000;
 const MAX_CONCURRENCY    = 3;
 const LOW_WATERMARK      = 10000;  // tokens — slow to 1 concurrent
 const CRITICAL_WATERMARK = 3000;   // tokens — pause all dispatch
 
-// ── State ─────────────────────────────────────────────────────────────────────
-
-let remaining   = null;  // real tokens remaining (from response headers, null = unknown)
-let resetAt     = 0;     // epoch ms when current rate-limit window resets
-let pausedUntil = 0;     // epoch ms — no new dispatches until this clears (429 wait)
-let inFlight    = 0;     // currently dispatched requests
-
-const connectionQueues = new Map();  // socket → item[]
-let rrCursor = 0;
-let draining = false;
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function log(msg) {
-  process.stdout.write(`[toklock ${new Date().toISOString().slice(11, 19)}] ${msg}\n`);
-}
 
 function parseReset(header) {
   if (!header) return 0;
@@ -51,130 +36,147 @@ function parseReset(header) {
   return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
-function concurrencyLimit() {
-  if (remaining === null || remaining >= LOW_WATERMARK) return MAX_CONCURRENCY;
-  return 1;
+function log(msg) {
+  process.stdout.write(`[toklock ${new Date().toISOString().slice(11, 19)}] ${msg}\n`);
 }
 
-function hasWork() {
-  for (const q of connectionQueues.values()) if (q.length > 0) return true;
-  return false;
-}
+// ── Proxy factory ─────────────────────────────────────────────────────────────
 
-function queuedCount() {
-  let n = 0;
-  for (const q of connectionQueues.values()) n += q.length;
-  return n;
-}
+export function createProxy({ port = DEFAULT_PORT, upstream = DEFAULT_UPSTREAM } = {}) {
 
-// Round-robin pick across connection queues
-function nextItem() {
-  const keys = [...connectionQueues.keys()];
-  for (let i = 0; i < keys.length; i++) {
-    const idx = (rrCursor + i) % keys.length;
-    const q = connectionQueues.get(keys[idx]);
-    if (q && q.length > 0) {
-      rrCursor = (idx + 1) % keys.length;
-      return q.shift();
-    }
+  // All state is local to this instance — safe for multiple instances and tests
+  let remaining   = null;  // real tokens remaining (null = unknown)
+  let resetAt     = 0;     // epoch ms when current rate-limit window resets
+  let pausedUntil = 0;     // epoch ms — no new dispatches until this clears (429 wait)
+  let inFlight    = 0;     // currently dispatched requests
+
+  const connectionQueues = new Map();  // socket → item[]
+  let rrCursor = 0;
+  let draining = false;
+
+  function concurrencyLimit() {
+    if (remaining === null || remaining >= LOW_WATERMARK) return MAX_CONCURRENCY;
+    return 1;
   }
-  return null;
-}
 
-// ── Dispatch ──────────────────────────────────────────────────────────────────
+  function hasWork() {
+    for (const q of connectionQueues.values()) if (q.length > 0) return true;
+    return false;
+  }
 
-async function dispatchItem(item) {
-  try {
-    const headers = { ...item.headers, host: 'api.anthropic.com' };
-    delete headers['content-length'];
+  function queuedCount() {
+    let n = 0;
+    for (const q of connectionQueues.values()) n += q.length;
+    return n;
+  }
 
-    const resp = await fetch(`${UPSTREAM}${item.path}`, {
-      method:  item.method,
-      headers,
-      body:    item.method !== 'GET' && item.body.length ? item.body : undefined,
-    });
-
-    // ── 429: pause all dispatch, re-queue to front of this connection ─────────
-    if (resp.status === 429) {
-      const retryAfter = parseInt(resp.headers.get('retry-after') || '60', 10);
-      pausedUntil = Date.now() + retryAfter * 1000;
-      log(`429 — pausing ${retryAfter}s, re-queuing to front (${queuedCount()} queued)`);
-
-      const q = connectionQueues.get(item.socket);
-      if (q) {
-        q.unshift(item);
-      } else {
-        // Socket closed while in flight — re-register temporarily so drain picks it up
-        connectionQueues.set(item.socket, [item]);
+  // Round-robin pick across connection queues
+  function nextItem() {
+    const keys = [...connectionQueues.keys()];
+    for (let i = 0; i < keys.length; i++) {
+      const idx = (rrCursor + i) % keys.length;
+      const q = connectionQueues.get(keys[idx]);
+      if (q && q.length > 0) {
+        rrCursor = (idx + 1) % keys.length;
+        return q.shift();
       }
-      return;
     }
-
-    // ── Update budget from real response headers ──────────────────────────────
-    const remHdr   = resp.headers.get('anthropic-ratelimit-tokens-remaining');
-    const resetHdr = resp.headers.get('anthropic-ratelimit-tokens-reset');
-
-    if (remHdr !== null) remaining = parseInt(remHdr, 10);
-    if (resetHdr)        resetAt   = parseReset(resetHdr);
-
-    log(`✓ ${resp.status} | remaining=${remaining ?? '?'} | inflight=${inFlight - 1} | queued=${queuedCount()}`);
-    item.resolve({ resp });
-
-  } catch (err) {
-    log(`upstream error: ${err.message}`);
-    item.resolve({ err });
-  }
-}
-
-// ── Round-robin drain loop ────────────────────────────────────────────────────
-
-async function drain() {
-  if (draining) return;
-  draining = true;
-
-  while (hasWork()) {
-    // Wait out 429 pause
-    if (Date.now() < pausedUntil) {
-      const wait = pausedUntil - Date.now() + 50;
-      log(`paused — resuming in ${(wait / 1000).toFixed(1)}s | queued=${queuedCount()}`);
-      await new Promise(r => setTimeout(r, wait));
-      continue;
-    }
-
-    // Critical watermark — pause before next dispatch
-    if (remaining !== null && remaining < CRITICAL_WATERMARK) {
-      const wait = Math.max(500, resetAt - Date.now() + 300);
-      log(`critical watermark (${remaining} tokens) — pausing ${(wait / 1000).toFixed(1)}s`);
-      await new Promise(r => setTimeout(r, wait));
-      remaining = null;  // will be corrected by next response header
-      continue;
-    }
-
-    // At concurrency limit — wait for a slot to open
-    if (inFlight >= concurrencyLimit()) {
-      await new Promise(r => setTimeout(r, 20));
-      continue;
-    }
-
-    const item = nextItem();
-    if (!item) break;
-
-    inFlight++;
-    dispatchItem(item).finally(() => {
-      inFlight--;
-      if (hasWork() && !draining) drain();
-    });
-    // Do not await — loop continues to fill remaining concurrency slots
+    return null;
   }
 
-  draining = false;
-  // Guard against work arriving in the gap between hasWork()=false and draining=false
-  if (hasWork()) setImmediate(drain);
-}
+  // ── Dispatch ────────────────────────────────────────────────────────────────
 
-// ── HTTP proxy server ─────────────────────────────────────────────────────────
+  async function dispatchItem(item) {
+    try {
+      const headers = { ...item.headers, host: new URL(upstream).host };
+      delete headers['content-length'];
 
-export function createProxy({ port = DEFAULT_PORT } = {}) {
+      const resp = await fetch(`${upstream}${item.path}`, {
+        method:  item.method,
+        headers,
+        body:    item.method !== 'GET' && item.body.length ? item.body : undefined,
+      });
+
+      // ── 429: pause all dispatch, re-queue to front of this connection ───────
+      if (resp.status === 429) {
+        const retryAfter = parseInt(resp.headers.get('retry-after') || '60', 10);
+        pausedUntil = Date.now() + retryAfter * 1000;
+        log(`429 — pausing ${retryAfter}s, re-queuing to front (${queuedCount()} queued)`);
+
+        const q = connectionQueues.get(item.socket);
+        if (q) {
+          q.unshift(item);
+        } else {
+          // Socket closed while in flight — re-register so drain picks it up
+          connectionQueues.set(item.socket, [item]);
+        }
+        return;
+      }
+
+      // ── Update budget from real response headers ────────────────────────────
+      const remHdr   = resp.headers.get('anthropic-ratelimit-tokens-remaining');
+      const resetHdr = resp.headers.get('anthropic-ratelimit-tokens-reset');
+
+      if (remHdr !== null) remaining = parseInt(remHdr, 10);
+      if (resetHdr)        resetAt   = parseReset(resetHdr);
+
+      log(`✓ ${resp.status} | remaining=${remaining ?? '?'} | inflight=${inFlight - 1} | queued=${queuedCount()}`);
+      item.resolve({ resp });
+
+    } catch (err) {
+      log(`upstream error: ${err.message}`);
+      item.resolve({ err });
+    }
+  }
+
+  // ── Round-robin drain loop ──────────────────────────────────────────────────
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+
+    while (hasWork()) {
+      // Wait out 429 pause
+      if (Date.now() < pausedUntil) {
+        const wait = pausedUntil - Date.now() + 50;
+        log(`paused — resuming in ${(wait / 1000).toFixed(1)}s | queued=${queuedCount()}`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+
+      // Critical watermark — pause before next dispatch
+      if (remaining !== null && remaining < CRITICAL_WATERMARK) {
+        const wait = Math.max(500, resetAt - Date.now() + 300);
+        log(`critical watermark (${remaining} tokens) — pausing ${(wait / 1000).toFixed(1)}s`);
+        await new Promise(r => setTimeout(r, wait));
+        remaining = null;  // will be corrected by next response header
+        continue;
+      }
+
+      // At concurrency limit — wait for a slot to open
+      if (inFlight >= concurrencyLimit()) {
+        await new Promise(r => setTimeout(r, 20));
+        continue;
+      }
+
+      const item = nextItem();
+      if (!item) break;
+
+      inFlight++;
+      dispatchItem(item).finally(() => {
+        inFlight--;
+        if (hasWork() && !draining) drain();
+      });
+      // Do not await — loop continues to fill remaining concurrency slots
+    }
+
+    draining = false;
+    // Guard against work arriving in the gap between hasWork()=false and draining=false
+    if (hasWork()) setImmediate(drain);
+  }
+
+  // ── HTTP proxy server ───────────────────────────────────────────────────────
+
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
@@ -189,7 +191,7 @@ export function createProxy({ port = DEFAULT_PORT } = {}) {
         socket.once('close', () => {
           const q = connectionQueues.get(socket);
           if (q) {
-            // Drain pending items — client is gone, resolve as error so promises don't hang
+            // Client is gone — resolve pending items as error so promises don't hang
             for (const item of q) item.resolve({ err: new Error('client disconnected') });
             connectionQueues.delete(socket);
           }
