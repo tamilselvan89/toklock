@@ -20,7 +20,9 @@
     "llm",
     "ai-agent",
     "token-bucket",
-    "claude-code"
+    "claude-code",
+    "fair-queue",
+    "multi-agent"
   ],
   "author": "Tamilselvan Chandran <spreethy26@gmail.com>",
   "license": "Apache-2.0",
