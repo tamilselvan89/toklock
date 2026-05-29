@@ -1,6 +1,6 @@
 {
   "name": "toklock",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Token-aware rate-limit queue proxy for the Anthropic Claude API. Agents never see a 429.",
   "type": "module",
   "main": "src/proxy.mjs",
